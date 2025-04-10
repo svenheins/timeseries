@@ -48,30 +48,162 @@ class InfluxDBHandler:
             print(f"InfluxDB connection test failed: {e}")
             return False
 
-    def ingest_data(self, symbol, period="3mo"):
+    def _check_data_exists(self, symbol, start_date, end_date, measurement):
+        """Checks if data exists for a given symbol, measurement, and time range."""
         try:
-            data = yf.download(symbol, period=period)
+            query_api = self.client.query_api()
+            # Convert datetime objects to RFC3339 strings if they are not already strings
+            start_str = start_date.isoformat() + "Z" if isinstance(start_date, datetime) else start_date
+            end_str = end_date.isoformat() + "Z" if isinstance(end_date, datetime) else end_date
+
+            query = (
+                f'from(bucket: "{self.bucket}")\n'
+                f'|> range(start: {start_str}, stop: {end_str})\n'
+                f'|> filter(fn: (r) => r["_measurement"] == "{measurement}")\n'
+                f'|> filter(fn: (r) => r.symbol == "{symbol}")\n'
+                f'|> limit(n: 1)\n' # Only need one record to confirm existence
+                f'|> count()' # Check if count > 0 (more robust might be needed)
+            )
+            # A simple check: query for one record. If result is not empty, data exists.
+            result = query_api.query(query, org=self.org)
+            return len(result) > 0 and len(result[0].records) > 0 and result[0].records[0].get_value() > 0
+
+        except Exception as e:
+            print(f"Error checking data existence for {measurement} {symbol}: {e}")
+            return False # Assume data doesn't exist if check fails
+
+    def _ingest_stock_data(self, symbol, start_date, end_date):
+        """Fetches and ingests stock data from yfinance."""
+        try:
+            # yfinance typically uses YYYY-MM-DD format
+            start_str = start_date.strftime('%Y-%m-%d') if isinstance(start_date, datetime) else start_date
+            end_str = end_date.strftime('%Y-%m-%d') if isinstance(end_date, datetime) else end_date
+
+            print(f"Fetching stock data for {symbol} from {start_str} to {end_str}...")
+            data = yf.download(symbol, start=start_str, end=end_str)
+            if data.empty:
+                print(f"No stock data found for {symbol} between {start_str} and {end_str}.")
+                return True # No data is not an error in this context
+
             write_api = self.client.write_api(write_options=SYNCHRONOUS)
+            points_to_write = []
             for index, row in data.iterrows():
+                # Ensure index is timezone-aware (UTC) for InfluxDB
+                ts = pd.Timestamp(index).tz_localize('UTC') if pd.Timestamp(index).tzinfo is None else pd.Timestamp(index).tz_convert('UTC')
+
                 point = (
                     Point("stock_data")
                     .tag("symbol", symbol)
-                    .time(index)
-                    .field("open", float(row["Open"].iloc[0]))
-                    .field("high", float(row["High"].iloc[0]))
-                    .field("low", float(row["Low"].iloc[0]))
-                    .field("close", float(row["Close"].iloc[0]))
-                    .field("volume", float(row["Volume"].iloc[0]))
+                    .time(ts) # Use timezone-aware timestamp
+                    .field("open", float(row["Open"])) # No .iloc[0] needed here
+                    .field("high", float(row["High"]))
+                    .field("low", float(row["Low"]))
+                    .field("close", float(row["Close"]))
+                    .field("volume", float(row["Volume"]))
                 )
                 if "Adj Close" in row:
-                    point = point.field("adj_close", row["Adj Close"])
-                write_api.write(bucket=self.bucket, org=self.org, record=point)
-            print(f"Data ingested for symbol '{symbol}' into bucket '{self.bucket}'")
+                    point = point.field("adj_close", float(row["Adj Close"]))
+                points_to_write.append(point)
+
+            if points_to_write:
+                write_api.write(bucket=self.bucket, org=self.org, record=points_to_write)
+                print(f"Ingested {len(points_to_write)} stock data points for symbol '{symbol}'")
             return True
         except Exception as e:
-            print(f"Error ingesting data for symbol '{symbol}': {e}")
+            print(f"Error ingesting stock data for symbol '{symbol}': {e}")
             return False
 
+    def _ingest_news_data(self, symbol, start_date, end_date):
+        """Fetches and ingests market news from Finnhub."""
+        if not self.finnhub_client:
+            print("Finnhub client not initialized. Skipping news ingestion.")
+            return False
+
+        try:
+            # Finnhub uses YYYY-MM-DD format
+            start_str = start_date.strftime('%Y-%m-%d') if isinstance(start_date, datetime) else start_date
+            end_str = end_date.strftime('%Y-%m-%d') if isinstance(end_date, datetime) else end_date
+
+            print(f"Fetching news data for {symbol} from {start_str} to {end_str}...")
+            # Finnhub might fetch news slightly outside the exact range, filter later if needed
+            news = self.finnhub_client.company_news(symbol, _from=start_str, to=end_str)
+
+            if not news:
+                print(f"No news found for symbol '{symbol}' between {start_str} and {end_str}.")
+                return True # No news is not an error
+
+            write_api = self.client.write_api(write_options=SYNCHRONOUS)
+            points_to_write = []
+            for item in news:
+                # Convert Finnhub timestamp (seconds since epoch) to datetime
+                news_time = datetime.utcfromtimestamp(item["datetime"])
+
+                # Optional: Filter news strictly within the requested date range
+                # if not (start_date <= news_time.date() <= end_date):
+                #    continue
+
+                point = (
+                    Point("market_news")
+                    .tag("symbol", symbol)
+                    .time(news_time, write_precision="s") # Use the news timestamp
+                    .field("headline", str(item["headline"]))
+                    .field("summary", str(item["summary"]))
+                    .field("source", str(item["source"]))
+                    .field("url", str(item["url"]))
+                    .field("id", int(item["id"])) # Finnhub news ID
+                    .field("category", str(item.get("category", "N/A")))
+                )
+                points_to_write.append(point)
+
+            if points_to_write:
+                write_api.write(bucket=self.bucket, org=self.org, record=points_to_write)
+                print(f"Ingested {len(points_to_write)} news items for symbol '{symbol}'")
+            else:
+                 print(f"No valid news points generated for symbol '{symbol}' between {start_str} and {end_str}.")
+
+            # Finnhub has rate limits, add a small delay
+            time.sleep(1)
+            return True
+        except Exception as e:
+            # Handle potential rate limiting errors from Finnhub more specifically if needed
+            print(f"Error ingesting news for symbol '{symbol}': {e}")
+            return False
+
+    def ingest_data(self, symbol, start_date, end_date):
+        """
+        Ingests stock data and market news for a given symbol and date range,
+        checking if data already exists in InfluxDB first.
+        """
+        # Ensure dates are datetime objects for comparison and formatting
+        if isinstance(start_date, str):
+            start_date = datetime.strptime(start_date, '%Y-%m-%d')
+        if isinstance(end_date, str):
+            end_date = datetime.strptime(end_date, '%Y-%m-%d')
+
+        # Check and ingest stock data
+        stock_exists = self._check_data_exists(symbol, start_date, end_date, "stock_data")
+        if not stock_exists:
+            print(f"Stock data for {symbol} ({start_date.date()} to {end_date.date()}) not found or incomplete. Ingesting...")
+            stock_success = self._ingest_stock_data(symbol, start_date, end_date)
+            if not stock_success:
+                print(f"Failed to ingest stock data for {symbol}.")
+                # Decide if you want to stop or continue with news
+        else:
+            print(f"Stock data for {symbol} ({start_date.date()} to {end_date.date()}) already exists. Skipping stock ingestion.")
+            stock_success = True # Treat existing data as success
+
+        # Check and ingest news data
+        news_exists = self._check_data_exists(symbol, start_date, end_date, "market_news")
+        if not news_exists:
+            print(f"News data for {symbol} ({start_date.date()} to {end_date.date()}) not found or incomplete. Ingesting...")
+            news_success = self._ingest_news_data(symbol, start_date, end_date)
+            if not news_success:
+                print(f"Failed to ingest news data for {symbol}.")
+        else:
+            print(f"News data for {symbol} ({start_date.date()} to {end_date.date()}) already exists. Skipping news ingestion.")
+            news_success = True # Treat existing data as success
+
+        return stock_success and news_success # Return overall success
     def retrieve_data(self, symbols, start_time, end_time):
         "Retrieves stock closing prices and market news for given symbols and time range."
         try:
@@ -232,70 +364,7 @@ class InfluxDBHandler:
             print(f"Error visualizing data: {e}")
             return False
 
-    def ingest_market_news(self, symbol, days_back=30):
-        "Fetches and ingests market news for a symbol from Finnhub."
-        if not self.finnhub_client:
-            print("Finnhub client not initialized. Skipping news ingestion.")
-            return False
-
-        try:
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=days_back)
-
-            interval = timedelta(days=7)
-            current_date = start_date
-            while current_date < end_date:
-                next_date = min(current_date + interval, end_date)
-
-                start_date_str = current_date.strftime("%Y-%m-%d")
-                end_date_str = next_date.strftime("%Y-%m-%d")
-
-                news = self.finnhub_client.company_news(
-                    symbol, _from=start_date_str, to=end_date_str
-                )
-
-                if not news:
-                    print(
-                        f"No news found for symbol '{symbol}' between {start_date_str} and {end_date_str}."
-                    )
-                else:
-                    write_api = self.client.write_api(write_options=SYNCHRONOUS)
-                    points_to_write = []
-                    for item in news:
-                        news_time = datetime.utcfromtimestamp(item["datetime"])
-
-                        point = (
-                            Point("market_news")
-                            .tag("symbol", symbol)
-                            .time(news_time, write_precision="s")
-                            .field("headline", str(item["headline"]))
-                            .field("summary", str(item["summary"]))
-                            .field("source", str(item["source"]))
-                            .field("url", str(item["url"]))
-                            .field("id", int(item["id"]))
-                            .field("category", str(item.get("category", "N/A")))
-                        )
-                        points_to_write.append(point)
-
-                    if points_to_write:
-                        write_api.write(
-                            bucket=self.bucket, org=self.org, record=points_to_write
-                        )
-                        print(
-                            f"Ingested {len(points_to_write)} news items for symbol '{symbol}' between {start_date_str} and {end_date_str}"
-                        )
-                    else:
-                        print(
-                            f"No valid news points generated for symbol '{symbol}' between {start_date_str} and {end_date_str}."
-                        )
-
-                current_date = next_date
-                time.sleep(1)
-
-            return True
-        except Exception as e:
-            print(f"Error ingesting news for symbol '{symbol}': {e}")
-            return False
+    # Removed old ingest_market_news method as its logic is now in _ingest_news_data
 
 
 if __name__ == "__main__":
@@ -304,14 +373,22 @@ if __name__ == "__main__":
     if influx_handler.connect():
         if influx_handler.test_connection():
             symbols = ["AAPL", "MSFT", "GOOG"]
-            for symbol in symbols:
-                influx_handler.ingest_data(symbol, period="2mo")
-                influx_handler.ingest_market_news(symbol, days_back=60)
+            # Define date range for ingestion
+            end_date_dt = datetime.now()
+            start_date_dt = end_date_dt - timedelta(days=90)
+            start_date_str = start_date_dt.strftime('%Y-%m-%d')
+            end_date_str = end_date_dt.strftime('%Y-%m-%d')
 
-            start_time = "-60d"
-            end_time = "now()"
+            for symbol in symbols:
+                print(f"\n--- Processing symbol: {symbol} ---")
+                # Use the new combined ingest_data method
+                influx_handler.ingest_data(symbol, start_date=start_date_str, end_date=end_date_str)
+
+            # Use relative time for retrieval query if desired, or specific dates
+            start_time_query = "-60d" # InfluxDB relative time
+            end_time_query = "now()"
             stock_df, news_data = influx_handler.retrieve_data(
-                symbols, start_time, end_time
+                symbols, start_time_query, end_time_query
             )
 
             if stock_df is not None and not stock_df.empty:
