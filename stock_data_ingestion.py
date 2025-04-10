@@ -379,14 +379,17 @@ if __name__ == "__main__":
             start_date_str = start_date_dt.strftime('%Y-%m-%d')
             end_date_str = end_date_dt.strftime('%Y-%m-%d')
 
+            start_date_str = "2024-12-02"  # Example start date
+            end_date_str = "2025-01-01"  # Example start date
+
             for symbol in symbols:
                 print(f"\n--- Processing symbol: {symbol} ---")
                 # Use the new combined ingest_data method
                 influx_handler.ingest_data(symbol, start_date=start_date_str, end_date=end_date_str)
 
             # Use relative time for retrieval query if desired, or specific dates
-            start_time_query = "-60d" # InfluxDB relative time
-            end_time_query = "now()"
+            start_time_query = start_date_str #"-60d" # InfluxDB relative time
+            end_time_query = end_date_str # "now()"
             stock_df, news_data = influx_handler.retrieve_data(
                 symbols, start_time_query, end_time_query
             )
