@@ -305,11 +305,10 @@ if __name__ == "__main__":
         if influx_handler.test_connection():
             symbols = ["AAPL", "MSFT", "GOOG"]
             for symbol in symbols:
-                pass
-                # influx_handler.ingest_data(symbol, period="3mo")
-                # influx_handler.ingest_market_news(symbol, days_back=60)
+                influx_handler.ingest_data(symbol, period="2mo")
+                influx_handler.ingest_market_news(symbol, days_back=60)
 
-            start_time = "-30d"
+            start_time = "-60d"
             end_time = "now()"
             stock_df, news_data = influx_handler.retrieve_data(
                 symbols, start_time, end_time
